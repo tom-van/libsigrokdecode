@@ -53,10 +53,22 @@ St = SrdStrEnum.from_str('St', s)
 jtag_states = [s.value for s in St]
 
 s = 'EC SPARE TPDEL TPREV TPST RDYC DLYC SCNFMT CP OAC'.split()
-s = ['CJTAG_' + x for x in s] + ['OSCAN1', 'FOUR_WIRE']
+s = ['CJTAG_' + x for x in s] + ['LEV2', 'CP1', 'CP2', 'CHK' ]
+CtrlSt = SrdStrEnum.from_list('CtrlSt', s)
+control_states = [s.value for s in CtrlSt]
+
+s = ['OSCAN1', 'OSCAN2', 'FOUR_WIRE']
 CSt = SrdStrEnum.from_list('CSt', s)
 
 cjtag_states = [s.value for s in CSt]
+
+cjtag_state_idx0 = len(jtag_states)
+control_state_idx0 = cjtag_state_idx0 + len(cjtag_states)
+tdi_idx = control_state_idx0 + len(control_states)
+tdo_idx = tdi_idx + 1
+tdi_bitstring_idx = tdi_idx + 2
+tdo_bitstring_idx = tdi_idx + 3
+tms_bits_idx = tdi_idx + 4
 
 class Decoder(srd.Decoder):
     api_version = 3
@@ -74,7 +86,8 @@ class Decoder(srd.Decoder):
     )
     annotations = \
         tuple([tuple([s.lower(), s]) for s in jtag_states]) + \
-        tuple([tuple([s.lower(), s]) for s in cjtag_states]) + ( \
+        tuple([tuple([s.lower(), s]) for s in cjtag_states]) + \
+        tuple([tuple([s.lower(), s]) for s in control_states]) + ( \
         ('bit-tdi', 'Bit (TDI)'),
         ('bit-tdo', 'Bit (TDO)'),
         ('bitstring-tdi', 'Bitstring (TDI)'),
@@ -82,13 +95,15 @@ class Decoder(srd.Decoder):
         ('bit-tms', 'Bit (TMS)'),
     )
     annotation_rows = (
-        ('bits-tdi', 'Bits (TDI)', (28,)),
-        ('bits-tdo', 'Bits (TDO)', (29,)),
-        ('bitstrings-tdi', 'Bitstrings (TDI)', (30,)),
-        ('bitstrings-tdo', 'Bitstrings (TDO)', (31,)),
-        ('bits-tms', 'Bits (TMS)', (32,)),
+        ('bits-tdi', 'Bits (TDI)', (tdi_idx,)),
+        ('bits-tdo', 'Bits (TDO)', (tdo_idx,)),
+        ('bitstrings-tdi', 'Bitstrings (TDI)', (tdi_bitstring_idx,)),
+        ('bitstrings-tdo', 'Bitstrings (TDO)', (tdo_bitstring_idx,)),
+        ('bits-tms', 'Bits (TMS)', (tms_bits_idx,)),
+        ('control-states', 'control states',
+            tuple(range(control_state_idx0, control_state_idx0 + len(control_states)))),
         ('cjtag-states', 'CJTAG states',
-            tuple(range(len(jtag_states), len(jtag_states + cjtag_states)))),
+            tuple(range(cjtag_state_idx0, cjtag_state_idx0 + len(cjtag_states)))),
         ('jtag-states', 'JTAG states', tuple(range(len(jtag_states)))),
     )
 
@@ -100,12 +115,15 @@ class Decoder(srd.Decoder):
         self.state = St.RUN_TEST_IDLE
         self.cjtagstate = CSt.FOUR_WIRE
         self.oldcjtagstate = None
+        self.ctrlstate = None
+        self.oldctrlstate = None
         self.escape_edges = 0
         self.oaclen = 0
         self.oldtms = 0
         self.oacp = 0
         self.oscan1cycle = 0
         self.oldstate = None
+        self.oldoldstate = None
         self.bits_tdi = []
         self.bits_tdo = []
         self.bits_samplenums_tdi = []
@@ -115,6 +133,12 @@ class Decoder(srd.Decoder):
         self.saved_item = None
         self.first = True
         self.first_bit = True
+        self.zbs_count = 0
+        self.control_level = 0
+        self.cp = {}
+        self.cp_num = 0
+        self.chk_cnt = 0
+        self.oscan_delay = 0
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -133,40 +157,39 @@ class Decoder(srd.Decoder):
         self.put(self.ss_bitstring, self.es_bitstring, self.out_python, data)
 
     def advance_state_machine(self, tms):
+        self.oldoldstate = self.oldstate
         self.oldstate = self.state
 
-        if self.cjtagstate.value.startswith('CJTAG_'):
+        if not self.ctrlstate is None and self.ctrlstate.value.startswith('CJTAG_'):
             self.oacp += 1
             if self.oacp > 4 and self.oaclen == 12:
-                self.cjtagstate = CSt.CJTAG_EC
+                self.ctrlstate = CtrlSt.CJTAG_EC
 
             if self.oacp == 8 and tms == 0:
                 self.oaclen = 36
             if self.oacp > 8 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_SPARE
+                self.ctrlstate = CtrlSt.CJTAG_SPARE
             if self.oacp > 13 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_TPDEL
+                self.ctrlstate = CtrlSt.CJTAG_TPDEL
             if self.oacp > 16 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_TPREV
+                self.ctrlstate = CtrlSt.CJTAG_TPREV
             if self.oacp > 18 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_TPST
+                self.ctrlstate = CtrlSt.CJTAG_TPST
             if self.oacp > 23 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_RDYC
+                self.ctrlstate = CtrlSt.CJTAG_RDYC
             if self.oacp > 25 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_DLYC
+                self.ctrlstate = CtrlSt.CJTAG_DLYC
             if self.oacp > 27 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_SCNFMT
+                self.ctrlstate = CtrlSt.CJTAG_SCNFMT
 
             if self.oacp > 8 and self.oaclen == 12:
-                self.cjtagstate = CSt.CJTAG_CP
+                self.ctrlstate = CtrlSt.CJTAG_CP
             if self.oacp > 32 and self.oaclen == 36:
-                self.cjtagstate = CSt.CJTAG_CP
+                self.ctrlstate = CtrlSt.CJTAG_CP
 
             if self.oacp > self.oaclen:
                 self.cjtagstate = CSt.OSCAN1
                 self.oscan1cycle = 1
-                # Because Nuclei cJTAG device asserts a reset during cJTAG
-                # online activating.
                 self.state = St.TEST_LOGIC_RESET
             return
 
@@ -224,27 +247,39 @@ class Decoder(srd.Decoder):
             self.putx([jtag_states.index(self.oldstate.value), [self.oldstate.value]])
             self.putp(['NEW STATE', self.state.value])
 
-            self.putx([len(jtag_states) + cjtag_states.index(self.oldcjtagstate.value),
+            self.putx([cjtag_state_idx0 + cjtag_states.index(self.oldcjtagstate.value),
                       [self.oldcjtagstate.value]])
-            if (self.oldcjtagstate.value.startswith('CJTAG_')):
-                self.putx([32, [str(self.oldtms)]])
+            if not self.oldctrlstate is None:
+                self.putx([control_state_idx0 + control_states.index(self.oldctrlstate.value),
+                      [self.oldctrlstate.value]])
+                if (self.oldctrlstate.value.startswith('CJTAG_')):
+                    self.putx([tms_bits_idx, [str(self.oldtms)]])
         self.oldtms = tms
 
         # Upon SHIFT-*/EXIT1-* collect the current TDI/TDO values.
         if self.oldstate.value.startswith('SHIFT-') or \
-           self.oldstate.value.startswith('EXIT1-'):
+                self.oldstate.value.startswith('EXIT1-'):
             if self.first_bit:
                 self.ss_bitstring = self.samplenum
                 self.first_bit = False
-            else:
-                self.putx([28, [str(self.bits_tdi[0])]])
-                self.putx([29, [str(self.bits_tdo[0])]])
-                # Use self.samplenum as ES of the previous bit.
-                self.bits_samplenums_tdi[0][1] = self.samplenum
-                self.bits_samplenums_tdo[0][1] = self.samplenum
+                if self.control_level == 2:
+                    if self.oldstate.value == 'SHIFT-DR' or self.oldstate.value == 'EXIT1-DR':
+                        self.cp_num += 1
+                        if self.cp_num == 1:
+                            self.ctrlstate = CtrlSt.CP1
+                        elif self.cp_num == 2:
+                            self.ctrlstate = CtrlSt.CP2
 
-            self.bits_tdi.insert(0, tdi)
-            self.bits_tdo.insert(0, tdo)
+        if (not self.oldoldstate is None) and self.oldoldstate.value.startswith('SHIFT-'):
+            self.putx([tdi_idx, [str(self.bits_tdi[0])]])
+            self.putx([tdo_idx, [str(self.bits_tdo[0])]])
+            # Use self.samplenum as ES of the previous bit.
+            self.bits_samplenums_tdi[0][1] = self.samplenum
+            self.bits_samplenums_tdo[0][1] = self.samplenum
+
+        if self.oldstate.value.startswith('SHIFT-'):
+            self.bits_tdi.insert(0, 'x' if tdi is None else tdi)
+            self.bits_tdo.insert(0, 'x' if tdo is None else tdo)
 
             # Use self.samplenum as SS of the current bit.
             self.bits_samplenums_tdi.insert(0, [self.samplenum, -1])
@@ -253,29 +288,71 @@ class Decoder(srd.Decoder):
         # Output all TDI/TDO bits if we just switched to UPDATE-*.
         if self.state.value.startswith('UPDATE-'):
 
+            nbits = len(self.bits_tdi)
+            if self.state.value == 'UPDATE-DR':
+                if self.control_level == 0:
+                    if nbits == 0:
+                        self.zbs_count += 1
+                    elif self.zbs_count > 0:
+                        self.control_level = self.zbs_count
+                        if self.control_level == 2:
+                            self.ctrlstate = CtrlSt.LEV2
+                        self.zbs_count = 0
+                        self.cp_num = 0
+                elif self.control_level == 2:
+                    self.cp[self.cp_num] = nbits
+                    self.ctrlstate = CtrlSt.LEV2
+
             self.es_bitstring = self.samplenum
 
             t = self.state.value[-2:] + ' TDI'
-            b = ''.join(map(str, self.bits_tdi[1:]))
-            h = ' (0x%x' % int('0b0' + b, 2) + ')'
-            s = t + ': ' + b + h + ', ' + str(len(self.bits_tdi[1:])) + ' bits'
-            self.putx_bs([30, [s]])
-            self.putp_bs([t, [b, self.bits_samplenums_tdi[1:]]])
+            b = ''.join(map(str, self.bits_tdi))
+            h = '' if 'x' in b else ' (0x%x' % int('0b0' + b, 2) + ')'
+            s = t + ': ' + b + h + ', ' + str(nbits) + ' bits'
+            self.putx_bs([tdi_bitstring_idx, [s]])
+            self.putp_bs([t, [b, self.bits_samplenums_tdi]])
             self.bits_tdi = []
             self.bits_samplenums_tdi = []
 
             t = self.state.value[-2:] + ' TDO'
-            b = ''.join(map(str, self.bits_tdo[1:]))
-            h = ' (0x%x' % int('0b0' + b, 2) + ')'
-            s = t + ': ' + b + h + ', ' + str(len(self.bits_tdo[1:])) + ' bits'
-            self.putx_bs([31, [s]])
-            self.putp_bs([t, [b, self.bits_samplenums_tdo[1:]]])
+            b = ''.join(map(str, self.bits_tdo))
+            h = '' if 'x' in b else ' (0x%x' % int('0b0' + b, 2) + ')'
+            s = t + ': ' + b + h + ', ' + str(len(self.bits_tdo)) + ' bits'
+            self.putx_bs([tdo_bitstring_idx, [s]])
+            self.putp_bs([t, [b, self.bits_samplenums_tdo]])
             self.bits_tdo = []
             self.bits_samplenums_tdo = []
 
             self.first_bit = True
 
             self.ss_bitstring = self.samplenum
+
+        if self.oldstate.value == 'UPDATE-DR':
+            if self.control_level == 2:
+                if self.cp_num == 2:
+                    self.cp_num = 0
+                    if self.cp[1] == 3 and self.cp[2] >= 8:
+                        self.oscan_delay = 2
+                        self.chk_cnt = 3
+                        self.ctrlstate = CtrlSt.CHK
+                    if self.cjtagstate != CSt.FOUR_WIRE:
+                        self.chk_cnt = 4
+                        self.ctrlstate = CtrlSt.CHK
+
+        if self.state.value == 'RUN-TEST/IDLE' and self.chk_cnt == 0:
+            self.ctrlstate = CtrlSt.LEV2 if self.control_level == 2 else None
+
+        if self.state.value == 'SELECT-IR':
+            self.control_level = 0;
+            self.ctrlstate = None
+
+        if self.oscan_delay:
+            self.oscan_delay-= 1
+            if self.oscan_delay == 0:
+                self.cjtagstate = CSt.OSCAN2 if self.cp[2] == 10 else CSt.OSCAN1
+                self.oscan1cycle = 0
+                self.state = St.TEST_LOGIC_RESET
+                self.ctrlstate = CtrlSt.LEV2
 
         self.ss_item = self.samplenum
 
@@ -284,11 +361,12 @@ class Decoder(srd.Decoder):
 
     def handle_tapc_state(self):
         self.oldcjtagstate = self.cjtagstate
+        self.oldctrlstate = self.ctrlstate
 
         if self.escape_edges >= 8:
             self.cjtagstate = CSt.FOUR_WIRE
         if self.escape_edges == 6:
-            self.cjtagstate = CSt.CJTAG_OAC
+            self.ctrlstate = CtrlSt.CJTAG_OAC
             self.oacp = 0
             self.oaclen = 12
 
@@ -302,7 +380,9 @@ class Decoder(srd.Decoder):
             tckc, tmsc = self.wait({0: 'r'})
             self.handle_tapc_state()
 
-            if self.cjtagstate == CSt.OSCAN1:
+            if self.chk_cnt > 0:
+                self.chk_cnt -= 1
+            elif self.cjtagstate == CSt.OSCAN1 or (self.cjtagstate == CSt.OSCAN2 and self.state.value.startswith('SHIFT-')):
                 if self.oscan1cycle == 0: # nTDI
                     tdi = 1 if (tmsc == 0) else 0
                     self.oscan1cycle = 1
